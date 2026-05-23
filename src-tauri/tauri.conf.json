@@ -1,0 +1,42 @@
+{
+  "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
+  "productName": "Perfect Pixels",
+  "version": "0.1.0",
+  "identifier": "com.rice.perfectpixels",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://127.0.0.1:5174",
+    "beforeDevCommand": "npm run dev -- --port 5174",
+    "beforeBuildCommand": "npm run build"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Perfect Pixels",
+        "width": 1280,
+        "height": 760,
+        "minWidth": 1080,
+        "minHeight": 680,
+        "resizable": true,
+        "fullscreen": false
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "android": {
+      "debugApplicationIdSuffix": ".debug"
+    }
+  }
+}
