@@ -1,5 +1,5 @@
-# Security Policy
+# 安全说明
 
-Perfect Pixels is a local-first editor. It should not upload user images, project files, or exports.
+Perfect Pixels 是本地优先的像素编辑器。默认设计是不上传用户图片、工程文件或导出结果。
 
-If you find a security issue, please open a private report or contact the maintainer before publishing details publicly.
+如果你发现安全问题，请优先通过私下方式联系维护者，或使用 GitHub 的安全报告功能，不要直接公开漏洞细节。

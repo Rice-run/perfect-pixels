@@ -1,7 +1,7 @@
 {
   "name": "perfect-pixels",
   "version": "0.1.0",
-  "description": "A desktop pixel frame editor for sprite sheets, palettes, layers, and animation preview.",
+  "description": "本地优先的像素逐帧图编辑器，支持切帧、调色盘、图层、动画预览和 Tauri 桌面端。",
   "license": "MIT",
   "type": "module",
   "scripts": {
