@@ -1,6 +1,6 @@
 [package]
 name = "perfect-pixels"
-version = "0.1.0"
+version = "0.1.1"
 description = "Pixel frame editor for sprite sheet cleanup and animation preview"
 authors = ["Rice"]
 license = ""
