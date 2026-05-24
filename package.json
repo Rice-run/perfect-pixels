@@ -1,6 +1,6 @@
 {
   "name": "perfect-pixels",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "本地优先的像素逐帧图编辑器，支持切帧、调色盘、图层、动画预览和 Tauri 桌面端。",
   "license": "MIT",
   "type": "module",
@@ -15,6 +15,7 @@
   "dependencies": {
     "@tauri-apps/api": "2.11.0",
     "@vitejs/plugin-react": "^5.0.0",
+    "gifenc": "^1.0.3",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "typescript": "^5.9.0",

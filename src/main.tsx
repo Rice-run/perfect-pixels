@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { createRoot, type Root } from "react-dom/client";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { GIFEncoder, applyPalette, quantize } from "gifenc";
 import "./styles.css";
 
 type Tool = "pencil" | "eraser" | "eyedropper" | "bucket" | "rectangle" | "line" | "replace" | "lighten" | "darken";
@@ -49,13 +50,46 @@ type ProjectFileHandle = {
 };
 type ProjectOrigin = "new" | "saved" | "imported" | "restored";
 type UnsavedDecision = "save" | "discard" | "cancel";
+type ExportPreset = "current-frame" | "sheet-horizontal" | "sheet-vertical" | "gif-preview" | "frames-zip";
+type ToolShortcuts = Record<Tool, string>;
 
 const DEFAULT_FRAME_SIZE = 48;
 const DEFAULT_LAYERS: Layer[] = [{ id: "layer-1", name: "图层 1", visible: true, locked: false }];
 const DEFAULT_PALETTE_ID = "project-basic";
 const CUSTOM_PALETTES_KEY = "pixel-frame-editor-palettes";
+const TOOL_SHORTCUTS_KEY = "perfect-pixels-tool-shortcuts";
 const AUTOSAVE_KEY = "perfect-pixels-autosave-v1";
 const AUTOSAVE_INTERVAL_MS = 10000;
+const DEFAULT_TOOL_SHORTCUTS: ToolShortcuts = {
+  pencil: "b",
+  eraser: "e",
+  eyedropper: "i",
+  bucket: "g",
+  rectangle: "r",
+  line: "l",
+  replace: "x",
+  lighten: "o",
+  darken: "p",
+};
+const GRID_PRESETS = [1, 2, 4, 8, 12, 16, 24, 32];
+const TOOL_DEFS: Array<{ id: Tool; label: string; icon: string }> = [
+  { id: "pencil", label: "画笔", icon: "✎" },
+  { id: "eraser", label: "橡皮", icon: "⌫" },
+  { id: "eyedropper", label: "吸管", icon: "◉" },
+  { id: "bucket", label: "颜料桶", icon: "▣" },
+  { id: "rectangle", label: "矩形", icon: "□" },
+  { id: "line", label: "直线", icon: "／" },
+  { id: "replace", label: "替换同色", icon: "⇄" },
+  { id: "lighten", label: "提亮", icon: "☼" },
+  { id: "darken", label: "压暗", icon: "◐" },
+];
+const EXPORT_PRESET_LABELS: Record<ExportPreset, string> = {
+  "current-frame": "当前帧 PNG",
+  "sheet-horizontal": "横向 Sprite Sheet",
+  "sheet-vertical": "纵向 Sprite Sheet",
+  "gif-preview": "GIF 预览",
+  "frames-zip": "每帧单独 PNG",
+};
 const DEFAULT_PALETTES: Palette[] = [
   {
     id: DEFAULT_PALETTE_ID,
@@ -293,6 +327,121 @@ function loadCustomPalettes() {
   }
 }
 
+function normalizeShortcutKey(value: string) {
+  return value.trim().slice(0, 1).toLowerCase();
+}
+
+function loadToolShortcuts(): ToolShortcuts {
+  try {
+    const raw = window.localStorage.getItem(TOOL_SHORTCUTS_KEY);
+    if (!raw) return DEFAULT_TOOL_SHORTCUTS;
+    const parsed = JSON.parse(raw) as Partial<ToolShortcuts>;
+    return TOOL_DEFS.reduce<ToolShortcuts>((shortcuts, toolDef) => {
+      shortcuts[toolDef.id] = normalizeShortcutKey(parsed[toolDef.id] ?? DEFAULT_TOOL_SHORTCUTS[toolDef.id]);
+      return shortcuts;
+    }, { ...DEFAULT_TOOL_SHORTCUTS });
+  } catch {
+    return DEFAULT_TOOL_SHORTCUTS;
+  }
+}
+
+function blobToBase64(blob: Blob) {
+  return new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = String(reader.result);
+      resolve(result.includes(",") ? result.split(",")[1] : result);
+    };
+    reader.onerror = () => reject(reader.error);
+    reader.readAsDataURL(blob);
+  });
+}
+
+function canvasToBlob(canvas: HTMLCanvasElement, type = "image/png") {
+  return new Promise<Blob>((resolve, reject) => {
+    canvas.toBlob((blob) => {
+      if (blob) resolve(blob);
+      else reject(new Error("Canvas export failed."));
+    }, type);
+  });
+}
+
+function crc32(bytes: Uint8Array) {
+  let crc = 0xffffffff;
+  for (const byte of bytes) {
+    crc ^= byte;
+    for (let bit = 0; bit < 8; bit += 1) {
+      crc = (crc >>> 1) ^ (0xedb88320 & -(crc & 1));
+    }
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function writeUint16(items: number[], value: number) {
+  items.push(value & 255, (value >>> 8) & 255);
+}
+
+function writeUint32(items: number[], value: number) {
+  items.push(value & 255, (value >>> 8) & 255, (value >>> 16) & 255, (value >>> 24) & 255);
+}
+
+function encodeUtf8(value: string) {
+  return new TextEncoder().encode(value);
+}
+
+function makeZip(files: Array<{ name: string; bytes: Uint8Array }>) {
+  const output: number[] = [];
+  const centralDirectory: number[] = [];
+  files.forEach((file) => {
+    const nameBytes = encodeUtf8(file.name);
+    const offset = output.length;
+    const checksum = crc32(file.bytes);
+    writeUint32(output, 0x04034b50);
+    writeUint16(output, 20);
+    writeUint16(output, 0x0800);
+    writeUint16(output, 0);
+    writeUint16(output, 0);
+    writeUint16(output, 0);
+    writeUint32(output, checksum);
+    writeUint32(output, file.bytes.length);
+    writeUint32(output, file.bytes.length);
+    writeUint16(output, nameBytes.length);
+    writeUint16(output, 0);
+    output.push(...nameBytes, ...file.bytes);
+
+    writeUint32(centralDirectory, 0x02014b50);
+    writeUint16(centralDirectory, 20);
+    writeUint16(centralDirectory, 20);
+    writeUint16(centralDirectory, 0x0800);
+    writeUint16(centralDirectory, 0);
+    writeUint16(centralDirectory, 0);
+    writeUint16(centralDirectory, 0);
+    writeUint32(centralDirectory, checksum);
+    writeUint32(centralDirectory, file.bytes.length);
+    writeUint32(centralDirectory, file.bytes.length);
+    writeUint16(centralDirectory, nameBytes.length);
+    writeUint16(centralDirectory, 0);
+    writeUint16(centralDirectory, 0);
+    writeUint16(centralDirectory, 0);
+    writeUint16(centralDirectory, 0);
+    writeUint32(centralDirectory, 0);
+    writeUint32(centralDirectory, offset);
+    centralDirectory.push(...nameBytes);
+  });
+
+  const centralOffset = output.length;
+  output.push(...centralDirectory);
+  writeUint32(output, 0x06054b50);
+  writeUint16(output, 0);
+  writeUint16(output, 0);
+  writeUint16(output, files.length);
+  writeUint16(output, files.length);
+  writeUint32(output, centralDirectory.length);
+  writeUint32(output, centralOffset);
+  writeUint16(output, 0);
+  return new Blob([new Uint8Array(output)], { type: "application/zip" });
+}
+
 function getPixel(imageData: ImageData, x: number, y: number) {
   const index = (y * imageData.width + x) * 4;
   const data = imageData.data;
@@ -446,8 +595,11 @@ function App() {
   const [fps, setFps] = useState(8);
   const [isPlaying, setIsPlaying] = useState(false);
   const [showGrid, setShowGrid] = useState(true);
+  const [gridSize, setGridSize] = useState(1);
   const [showOnion, setShowOnion] = useState(true);
   const [showGuides, setShowGuides] = useState(true);
+  const [exportPreset, setExportPreset] = useState<ExportPreset>("sheet-horizontal");
+  const [toolShortcuts, setToolShortcuts] = useState<ToolShortcuts>(loadToolShortcuts);
   const [history, setHistory] = useState<Frame[][]>([]);
   const [sourceSheet, setSourceSheet] = useState<ImageData | null>(null);
   const [sheetName, setSheetName] = useState("edited_sprite_sheet");
@@ -521,6 +673,10 @@ function App() {
   useEffect(() => {
     window.localStorage.setItem(CUSTOM_PALETTES_KEY, JSON.stringify(customPalettes));
   }, [customPalettes]);
+
+  useEffect(() => {
+    window.localStorage.setItem(TOOL_SHORTCUTS_KEY, JSON.stringify(toolShortcuts));
+  }, [toolShortcuts]);
 
   const addColorToPalette = useCallback((hex: string, targetPaletteId = activePaletteId) => {
     const normalized = normalizeHex(hex);
@@ -603,15 +759,16 @@ function App() {
     }
 
     if (showGrid && zoom >= 6) {
-      ctx.strokeStyle = "rgba(29, 37, 50, 0.16)";
       ctx.lineWidth = 1;
       for (let x = 0; x <= width; x += 1) {
+        ctx.strokeStyle = x % gridSize === 0 ? "rgba(29, 37, 50, 0.32)" : "rgba(29, 37, 50, 0.12)";
         ctx.beginPath();
         ctx.moveTo(x * zoom + 0.5, 0);
         ctx.lineTo(x * zoom + 0.5, canvas.height);
         ctx.stroke();
       }
       for (let y = 0; y <= height; y += 1) {
+        ctx.strokeStyle = y % gridSize === 0 ? "rgba(29, 37, 50, 0.32)" : "rgba(29, 37, 50, 0.12)";
         ctx.beginPath();
         ctx.moveTo(0, y * zoom + 0.5);
         ctx.lineTo(canvas.width, y * zoom + 0.5);
@@ -674,6 +831,7 @@ function App() {
     showGrid,
     showGuides,
     showOnion,
+    gridSize,
     tool,
     zoom,
     soloLayerIndex,
@@ -808,7 +966,7 @@ function App() {
     setSourceSheet(null);
   };
 
-  const canvasPoint = (event: React.PointerEvent<HTMLCanvasElement>) => {
+  const canvasPoint = (event: React.PointerEvent<HTMLCanvasElement> | React.MouseEvent<HTMLCanvasElement>) => {
     const canvas = editorCanvasRef.current;
     if (!canvas || !activeLayerImageData) return null;
     const rect = canvas.getBoundingClientRect();
@@ -816,6 +974,55 @@ function App() {
     const y = Math.floor(((event.clientY - rect.top) / rect.height) * activeLayerImageData.height);
     if (x < 0 || y < 0 || x >= activeLayerImageData.width || y >= activeLayerImageData.height) return null;
     return { x, y };
+  };
+
+  const pickColorAtPoint = (point: Point | null) => {
+    if (!point || !activeLayerImageData) return;
+    const pixel = getPixel(activeLayerImageData, point.x, point.y);
+    if (pixel.a <= 0) return;
+    const pickedColor = rgbaToHex(pixel.r, pixel.g, pixel.b);
+    setColor(pickedColor);
+    if (autoAddPickedColor) addColorToPalette(pickedColor);
+  };
+
+  const startCanvasPan = (event: React.PointerEvent, target: HTMLElement) => {
+    isPanningRef.current = true;
+    target.setPointerCapture(event.pointerId);
+    panStartRef.current = {
+      x: event.clientX,
+      y: event.clientY,
+      scrollLeft: target.scrollLeft,
+      scrollTop: target.scrollTop,
+    };
+  };
+
+  const zoomAroundPointer = (event: React.WheelEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    const scroll = event.currentTarget;
+    const canvas = editorCanvasRef.current;
+    if (!canvas || !activeLayerImageData) return;
+    const nextZoom = Math.max(2, Math.min(48, zoom + (event.deltaY < 0 ? 1 : -1)));
+    if (nextZoom === zoom) return;
+    const canvasRect = canvas.getBoundingClientRect();
+    const pointerX = event.clientX - canvasRect.left;
+    const pointerY = event.clientY - canvasRect.top;
+    const imageX = pointerX / zoom;
+    const imageY = pointerY / zoom;
+    setZoom(nextZoom);
+    window.requestAnimationFrame(() => {
+      const nextCanvasRect = canvas.getBoundingClientRect();
+      scroll.scrollLeft += imageX * nextZoom - (event.clientX - nextCanvasRect.left);
+      scroll.scrollTop += imageY * nextZoom - (event.clientY - nextCanvasRect.top);
+    });
+  };
+
+  const setToolShortcut = (toolId: Tool, value: string) => {
+    const normalized = normalizeShortcutKey(value);
+    setToolShortcuts((current) => ({ ...current, [toolId]: normalized }));
+  };
+
+  const resetToolShortcuts = () => {
+    setToolShortcuts({ ...DEFAULT_TOOL_SHORTCUTS });
   };
 
   const floodFill = (imageData: ImageData, x: number, y: number, fillColor: { r: number; g: number; b: number; a: number }) => {
@@ -843,12 +1050,7 @@ function App() {
     if (firstStroke && tool !== "eyedropper") pushHistory();
 
     if (tool === "eyedropper") {
-      const pixel = getPixel(activeLayerImageData, point.x, point.y);
-      if (pixel.a > 0) {
-        const pickedColor = rgbaToHex(pixel.r, pixel.g, pixel.b);
-        setColor(pickedColor);
-        if (autoAddPickedColor) addColorToPalette(pickedColor);
-      }
+      pickColorAtPoint(point);
       return;
     }
 
@@ -909,24 +1111,28 @@ function App() {
     });
   };
 
-  const exportSheetCanvas = () => {
+  const exportSheetCanvas = (direction: "horizontal" | "vertical") => {
     const width = compositedActiveFrame?.width ?? frameWidth;
     const height = compositedActiveFrame?.height ?? frameHeight;
     const canvas = document.createElement("canvas");
-    canvas.width = width * frames.length;
-    canvas.height = height;
+    canvas.width = direction === "horizontal" ? width * frames.length : width;
+    canvas.height = direction === "horizontal" ? height : height * frames.length;
     const ctx = get2d(canvas);
     frames.forEach((frame, index) => {
-      ctx.putImageData(compositeFrame(frame, layers, soloLayerIndex), index * width, 0);
+      ctx.putImageData(
+        compositeFrame(frame, layers, soloLayerIndex),
+        direction === "horizontal" ? index * width : 0,
+        direction === "horizontal" ? 0 : index * height,
+      );
     });
     return canvas;
   };
 
-  const downloadCanvas = async (canvas: HTMLCanvasElement, name: string) => {
-    const dataUrl = canvas.toDataURL("image/png");
+  const downloadBlob = async (blob: Blob, name: string) => {
     if (isTauriRuntime()) {
       try {
-        const savedPath = await invoke<string | null>("export_png", { filename: name, dataUrl });
+        const content = await blobToBase64(blob);
+        const savedPath = await invoke<string | null>("export_file", { filename: name, contentBase64: content });
         setExportStatus(savedPath ? `已导出：${savedPath}` : "已取消导出");
         return;
       } catch (error) {
@@ -936,17 +1142,69 @@ function App() {
     }
     const link = document.createElement("a");
     link.download = name;
-    link.href = dataUrl;
+    link.href = URL.createObjectURL(blob);
     link.click();
+    URL.revokeObjectURL(link.href);
+    setExportStatus(`已导出：${name}`);
   };
 
-  const exportSheet = () => {
-    void downloadCanvas(exportSheetCanvas(), `${sheetName}_edited.png`);
+  const downloadCanvas = async (canvas: HTMLCanvasElement, name: string) => {
+    await downloadBlob(await canvasToBlob(canvas, "image/png"), name);
   };
 
-  const exportActiveFrame = () => {
+  const exportGifPreview = async () => {
+    const width = compositedActiveFrame?.width ?? frameWidth;
+    const height = compositedActiveFrame?.height ?? frameHeight;
+    const gif = GIFEncoder();
+    const delay = Math.max(20, Math.round(1000 / fps));
+    frames.forEach((frame) => {
+      const imageData = compositeFrame(frame, layers, soloLayerIndex);
+      const palette = quantize(imageData.data, 256, { format: "rgba4444", oneBitAlpha: 8 });
+      const index = applyPalette(imageData.data, palette, "rgba4444");
+      gif.writeFrame(index, width, height, { palette, delay, repeat: 0, transparent: true, transparentIndex: 0 });
+    });
+    gif.finish();
+    const gifBytes = gif.bytes();
+    await downloadBlob(new Blob([gifBytes.slice()], { type: "image/gif" }), `${sheetName}_preview.gif`);
+  };
+
+  const exportFramesZip = async () => {
+    const files = await Promise.all(
+      frames.map(async (frame, index) => {
+        const canvas = imageDataToCanvas(compositeFrame(frame, layers, soloLayerIndex));
+        const blob = await canvasToBlob(canvas, "image/png");
+        return {
+          name: `${sheetName}_frame_${String(index + 1).padStart(2, "0")}.png`,
+          bytes: new Uint8Array(await blob.arrayBuffer()),
+        };
+      }),
+    );
+    await downloadBlob(makeZip(files), `${sheetName}_frames.zip`);
+  };
+
+  const exportActiveFrame = async () => {
     if (!compositedActiveFrame) return;
-    void downloadCanvas(imageDataToCanvas(compositedActiveFrame), `${sheetName}_frame_${String(activeIndex + 1).padStart(2, "0")}.png`);
+    await downloadCanvas(imageDataToCanvas(compositedActiveFrame), `${sheetName}_frame_${String(activeIndex + 1).padStart(2, "0")}.png`);
+  };
+
+  const exportSelectedPreset = async () => {
+    if (exportPreset === "current-frame") {
+      await exportActiveFrame();
+      return;
+    }
+    if (exportPreset === "sheet-horizontal") {
+      await downloadCanvas(exportSheetCanvas("horizontal"), `${sheetName}_sheet_horizontal.png`);
+      return;
+    }
+    if (exportPreset === "sheet-vertical") {
+      await downloadCanvas(exportSheetCanvas("vertical"), `${sheetName}_sheet_vertical.png`);
+      return;
+    }
+    if (exportPreset === "gif-preview") {
+      await exportGifPreview();
+      return;
+    }
+    await exportFramesZip();
   };
 
   const downloadProjectBlob = (blob: Blob) => {
@@ -1397,15 +1655,11 @@ function App() {
 
       if (event.ctrlKey || event.metaKey || event.altKey) return;
 
-      if (key === "b") setTool("pencil");
-      if (key === "e") setTool("eraser");
-      if (key === "i") setTool("eyedropper");
-      if (key === "g") setTool("bucket");
-      if (key === "r") setTool("rectangle");
-      if (key === "l") setTool("line");
-      if (key === "x") setTool("replace");
-      if (key === "o") setTool("lighten");
-      if (key === "p") setTool("darken");
+      const matchingTool = TOOL_DEFS.find((toolDef) => toolShortcuts[toolDef.id] === key)?.id;
+      if (matchingTool) {
+        setTool(matchingTool);
+        return;
+      }
       if (event.key === "[") setBrushSize((size) => Math.max(1, size - 1));
       if (event.key === "]") setBrushSize((size) => Math.min(12, size + 1));
     };
@@ -1423,7 +1677,7 @@ function App() {
       window.removeEventListener("keydown", handleKeyDown);
       window.removeEventListener("keyup", handleKeyUp);
     };
-  }, [history, undo]);
+  }, [history, toolShortcuts, undo]);
 
   return (
     <main className="app-shell">
@@ -1458,7 +1712,17 @@ function App() {
         <div className="top-actions">
           <button onClick={undo} disabled={history.length === 0}>撤销</button>
           <button onClick={exportActiveFrame}>导出当前帧</button>
-          <button className="primary" onClick={exportSheet}>导出 Sprite Sheet</button>
+          <select
+            className="export-preset-select"
+            value={exportPreset}
+            onChange={(event) => setExportPreset(event.target.value as ExportPreset)}
+            aria-label="导出预设"
+          >
+            {(Object.keys(EXPORT_PRESET_LABELS) as ExportPreset[]).map((preset) => (
+              <option key={preset} value={preset}>{EXPORT_PRESET_LABELS[preset]}</option>
+            ))}
+          </select>
+          <button className="primary" onClick={() => void exportSelectedPreset()}>按预设导出</button>
         </div>
       </header>
       {exportStatus && <div className="export-status">{exportStatus}</div>}
@@ -1481,25 +1745,16 @@ function App() {
         <aside className="panel tools-panel">
           <h2>工具</h2>
           <div className="tool-grid">
-            {(["pencil", "eraser", "eyedropper", "bucket", "rectangle", "line", "replace", "lighten", "darken"] as Tool[]).map((item) => (
-              <button key={item} className={tool === item ? "active" : ""} onClick={() => setTool(item)}>
-                {item === "pencil"
-                  ? "画笔"
-                  : item === "eraser"
-                    ? "橡皮"
-                    : item === "eyedropper"
-                      ? "吸管"
-                      : item === "bucket"
-                        ? "颜料桶"
-                        : item === "rectangle"
-                          ? "矩形"
-                          : item === "line"
-                            ? "直线"
-                            : item === "replace"
-                              ? "替换同色"
-                              : item === "lighten"
-                                ? "提亮"
-                                : "压暗"}
+            {TOOL_DEFS.map((toolDef) => (
+              <button
+                key={toolDef.id}
+                className={`tool-button ${tool === toolDef.id ? "active" : ""}`}
+                onClick={() => setTool(toolDef.id)}
+                title={`${toolDef.label} (${toolShortcuts[toolDef.id].toUpperCase() || "未设置"})`}
+                aria-label={toolDef.label}
+              >
+                <span aria-hidden="true">{toolDef.icon}</span>
+                <kbd>{toolShortcuts[toolDef.id].toUpperCase()}</kbd>
               </button>
             ))}
           </div>
@@ -1580,6 +1835,28 @@ function App() {
             <label><input type="checkbox" checked={showOnion} onChange={(event) => setShowOnion(event.target.checked)} /> 洋葱皮</label>
             <label><input type="checkbox" checked={showGuides} onChange={(event) => setShowGuides(event.target.checked)} /> 中线/脚底参考</label>
           </div>
+          <label className="rect-mode">
+            网格规格
+            <select value={gridSize} onChange={(event) => setGridSize(Number(event.target.value))}>
+              {GRID_PRESETS.map((preset) => (
+                <option key={preset} value={preset}>{preset}px</option>
+              ))}
+            </select>
+          </label>
+          <h2>快捷键</h2>
+          <div className="shortcut-grid">
+            {TOOL_DEFS.map((toolDef) => (
+              <label key={toolDef.id}>
+                {toolDef.label}
+                <input
+                  maxLength={1}
+                  value={toolShortcuts[toolDef.id]}
+                  onChange={(event) => setToolShortcut(toolDef.id, event.target.value)}
+                />
+              </label>
+            ))}
+          </div>
+          <button onClick={resetToolShortcuts}>恢复默认快捷键</button>
         </aside>
 
         <section className="canvas-stage">
@@ -1594,6 +1871,7 @@ function App() {
           <div
             ref={canvasScrollRef}
             className={`canvas-scroll ${isSpacePanning ? "panning-ready" : ""}`}
+            onWheel={zoomAroundPointer}
             onPointerMove={(event) => {
               if (!isPanningRef.current) return;
               const start = panStartRef.current;
@@ -1601,15 +1879,9 @@ function App() {
               event.currentTarget.scrollTop = start.scrollTop - (event.clientY - start.y);
             }}
             onPointerDown={(event) => {
-              if (!isSpacePanningRef.current) return;
-              isPanningRef.current = true;
-              event.currentTarget.setPointerCapture(event.pointerId);
-              panStartRef.current = {
-                x: event.clientX,
-                y: event.clientY,
-                scrollLeft: event.currentTarget.scrollLeft,
-                scrollTop: event.currentTarget.scrollTop,
-              };
+              if (!isSpacePanningRef.current && event.button !== 1) return;
+              event.preventDefault();
+              startCanvasPan(event, event.currentTarget);
             }}
             onPointerUp={() => {
               isPanningRef.current = false;
@@ -1622,14 +1894,14 @@ function App() {
               ref={editorCanvasRef}
               onPointerDown={(event) => {
                 event.currentTarget.setPointerCapture(event.pointerId);
-                if (isSpacePanningRef.current && canvasScrollRef.current) {
-                  isPanningRef.current = true;
-                  panStartRef.current = {
-                    x: event.clientX,
-                    y: event.clientY,
-                    scrollLeft: canvasScrollRef.current.scrollLeft,
-                    scrollTop: canvasScrollRef.current.scrollTop,
-                  };
+                if ((isSpacePanningRef.current || event.button === 1) && canvasScrollRef.current) {
+                  event.preventDefault();
+                  startCanvasPan(event, canvasScrollRef.current);
+                  return;
+                }
+                if (event.button === 2) {
+                  event.preventDefault();
+                  pickColorAtPoint(canvasPoint(event));
                   return;
                 }
                 const point = canvasPoint(event);
@@ -1684,7 +1956,18 @@ function App() {
               onPointerLeave={() => {
                 if (!isPaintingRef.current) setCursorPoint(null);
               }}
+              onContextMenu={(event) => {
+                event.preventDefault();
+                pickColorAtPoint(canvasPoint(event));
+              }}
             />
+          </div>
+          <div className="status-bar">
+            <span>坐标：{cursorPoint ? `${cursorPoint.x}, ${cursorPoint.y}` : "--, --"}</span>
+            <span>颜色：<code>{color}</code></span>
+            <span>帧：{activeIndex + 1}/{frames.length}</span>
+            <span>图层：{activeLayer?.name ?? "--"}</span>
+            <span>缩放：{zoom}x</span>
           </div>
           <div className="timeline">
             <div className="timeline-header">

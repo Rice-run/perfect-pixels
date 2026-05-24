@@ -194,6 +194,10 @@ button.active {
   gap: 10px;
 }
 
+.export-preset-select {
+  min-width: 180px;
+}
+
 .workspace {
   flex: 1;
   display: grid;
@@ -307,8 +311,34 @@ select {
 
 .tool-grid {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 8px;
+}
+
+.tool-button {
+  position: relative;
+  display: grid;
+  place-items: center;
+  min-height: 42px;
+  padding: 6px;
+}
+
+.tool-button span {
+  font-size: 18px;
+  line-height: 1;
+}
+
+.tool-button kbd {
+  position: absolute;
+  right: 4px;
+  bottom: 3px;
+  color: #6b7688;
+  font-size: 9px;
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+}
+
+.tool-button.active kbd {
+  color: rgba(255, 255, 255, 0.82);
 }
 
 .color-row {
@@ -399,9 +429,28 @@ code {
   gap: 8px;
 }
 
+.shortcut-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.shortcut-grid label {
+  gap: 4px;
+  font-size: 12px;
+}
+
+.shortcut-grid input {
+  min-width: 0;
+  padding: 6px;
+  text-align: center;
+  text-transform: uppercase;
+}
+
 .canvas-stage {
   display: grid;
-  grid-template-rows: auto 1fr auto;
+  grid-template-rows: auto 1fr auto auto;
   min-width: 0;
   min-height: 0;
   background: #e8edf4;
@@ -452,6 +501,23 @@ code {
 .canvas-scroll.panning-ready:active,
 .canvas-scroll.panning-ready:active canvas {
   cursor: grabbing;
+}
+
+.status-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+  align-items: center;
+  min-height: 34px;
+  padding: 7px 16px;
+  border-top: 1px solid #d3dae5;
+  background: #ffffff;
+  color: #48566d;
+  font-size: 12px;
+}
+
+.status-bar span {
+  white-space: nowrap;
 }
 
 .preview-canvas {

@@ -1,6 +1,6 @@
 Unicode true
 Name "Perfect Pixels"
-OutFile "target\release\bundle\nsis\Perfect Pixels_0.1.1_x64-setup.exe"
+OutFile "target\release\bundle\nsis\Perfect Pixels_0.1.2_x64-setup.exe"
 InstallDir "$LOCALAPPDATA\Perfect Pixels"
 RequestExecutionLevel user
 
@@ -26,7 +26,7 @@ Section "Install"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APP_NAME}" "UninstallString" "$INSTDIR\Uninstall.exe"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APP_NAME}" "DisplayIcon" "$INSTDIR\${APP_EXE}"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APP_NAME}" "Publisher" "Rice"
-  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APP_NAME}" "DisplayVersion" "0.1.1"
+  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APP_NAME}" "DisplayVersion" "0.1.2"
 SectionEnd
 
 Section "Uninstall"
