@@ -447,6 +447,7 @@ function App() {
   const [sourceSheet, setSourceSheet] = useState<ImageData | null>(null);
   const [sheetName, setSheetName] = useState("edited_sprite_sheet");
   const [projectFileName, setProjectFileName] = useState<string | null>(null);
+  const [projectFileBound, setProjectFileBound] = useState(false);
   const [exportStatus, setExportStatus] = useState("");
   const [draggedFrameIndex, setDraggedFrameIndex] = useState<number | null>(null);
   const [draggedLayerIndex, setDraggedLayerIndex] = useState<number | null>(null);
@@ -687,6 +688,10 @@ function App() {
     setRows(guessed.rows);
     sliceFromCanvas(source, guessed.width, guessed.height, guessed.columns, guessed.rows, true);
     setSheetName(file.name.replace(/\.[^.]+$/, "") || "edited_sprite_sheet");
+    projectFileHandleRef.current = null;
+    setProjectFileName(null);
+    setProjectFileBound(false);
+    setExportStatus(`已导入 ${file.name}，当前为未保存的新工程`);
   };
 
   const sliceFromCanvas = (
@@ -934,10 +939,12 @@ function App() {
     await writable.close();
   };
 
-  const saveProject = async () => {
+  const saveProject = async (saveAs = false) => {
     const blob = new Blob([JSON.stringify(buildProjectFile())], { type: "application/json" });
-    if (projectFileHandleRef.current) {
+    if (!saveAs && projectFileHandleRef.current) {
       await writeProjectToHandle(projectFileHandleRef.current, blob);
+      setProjectFileBound(true);
+      setExportStatus(`已保存工程：${projectFileName ?? "当前工程"}`);
       return;
     }
 
@@ -948,11 +955,16 @@ function App() {
       });
       projectFileHandleRef.current = handle;
       setProjectFileName(handle.name);
+      setProjectFileBound(true);
       await writeProjectToHandle(handle, blob);
+      setExportStatus(`已保存工程：${handle.name}`);
       return;
     }
 
     downloadProjectBlob(blob);
+    projectFileHandleRef.current = null;
+    setProjectFileBound(false);
+    setExportStatus("已下载工程文件；浏览器模式下不会绑定覆盖保存位置");
   };
 
   const openProject = async (file: File, handle: ProjectFileHandle | null = null) => {
@@ -993,6 +1005,8 @@ function App() {
     setSourceSheet(null);
     projectFileHandleRef.current = handle;
     setProjectFileName(handle?.name ?? file.name);
+    setProjectFileBound(Boolean(handle));
+    setExportStatus(`已打开工程：${handle?.name ?? file.name}`);
   };
 
   const openProjectFromPicker = async () => {
@@ -1622,11 +1636,13 @@ function App() {
               onChange={(event) => {
                 const file = event.target.files?.[0];
                 if (file) void importImage(file);
+                event.currentTarget.value = "";
               }}
             />
           </label>
           <div className="project-actions">
-            <button onClick={saveProject}>保存工程</button>
+            <button onClick={() => void saveProject()}>保存工程</button>
+            <button onClick={() => void saveProject(true)}>另存为</button>
             <button onClick={() => void openProjectFromPicker()}>打开工程</button>
             <label className="project-file-button hidden-project-input">
               <input
@@ -1641,7 +1657,14 @@ function App() {
               />
             </label>
           </div>
-          {projectFileName && <p className="project-status">当前工程：{projectFileName}</p>}
+          <p className="project-status">
+            当前工程：
+            {projectFileName
+              ? projectFileBound
+                ? projectFileName
+                : `${projectFileName}（未绑定保存位置，保存时会另存）`
+              : "未保存新工程（保存时会选择新文件）"}
+          </p>
           <div className="field-grid">
             <label>
               帧宽
