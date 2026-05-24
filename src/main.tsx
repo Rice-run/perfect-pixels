@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { invoke } from "@tauri-apps/api/core";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import "./styles.css";
 
 type Tool = "pencil" | "eraser" | "eyedropper" | "bucket" | "rectangle" | "line" | "replace" | "lighten" | "darken";
@@ -46,11 +47,15 @@ type ProjectFileHandle = {
   getFile(): Promise<File>;
   createWritable(): Promise<ProjectWritableFileStream>;
 };
+type ProjectOrigin = "new" | "saved" | "imported" | "restored";
+type UnsavedDecision = "save" | "discard" | "cancel";
 
 const DEFAULT_FRAME_SIZE = 48;
 const DEFAULT_LAYERS: Layer[] = [{ id: "layer-1", name: "图层 1", visible: true, locked: false }];
 const DEFAULT_PALETTE_ID = "project-basic";
 const CUSTOM_PALETTES_KEY = "pixel-frame-editor-palettes";
+const AUTOSAVE_KEY = "perfect-pixels-autosave-v1";
+const AUTOSAVE_INTERVAL_MS = 10000;
 const DEFAULT_PALETTES: Palette[] = [
   {
     id: DEFAULT_PALETTE_ID,
@@ -448,6 +453,9 @@ function App() {
   const [sheetName, setSheetName] = useState("edited_sprite_sheet");
   const [projectFileName, setProjectFileName] = useState<string | null>(null);
   const [projectFileBound, setProjectFileBound] = useState(false);
+  const [projectOrigin, setProjectOrigin] = useState<ProjectOrigin>("new");
+  const [lastSavedSnapshot, setLastSavedSnapshot] = useState<string | null>(null);
+  const [unsavedPrompt, setUnsavedPrompt] = useState<{ message: string } | null>(null);
   const [exportStatus, setExportStatus] = useState("");
   const [draggedFrameIndex, setDraggedFrameIndex] = useState<number | null>(null);
   const [draggedLayerIndex, setDraggedLayerIndex] = useState<number | null>(null);
@@ -457,6 +465,10 @@ function App() {
   const canvasScrollRef = useRef<HTMLDivElement | null>(null);
   const projectFileInputRef = useRef<HTMLInputElement | null>(null);
   const projectFileHandleRef = useRef<ProjectFileHandle | null>(null);
+  const unsavedPromptResolveRef = useRef<((decision: UnsavedDecision) => void) | null>(null);
+  const shouldCaptureCleanSnapshotRef = useRef(true);
+  const didCheckAutosaveRef = useRef(false);
+  const allowWindowCloseRef = useRef(false);
   const isPaintingRef = useRef(false);
   const isSpacePanningRef = useRef(false);
   const isPanningRef = useRef(false);
@@ -481,6 +493,30 @@ function App() {
   const palettes = useMemo(() => [...DEFAULT_PALETTES, ...customPalettes], [customPalettes]);
   const activePalette = palettes.find((palette) => palette.id === activePaletteId) ?? palettes[0];
   const canEditActivePalette = !activePalette.locked;
+  const projectTitle = projectFileName ?? (sheetName || "未命名工程");
+  const buildProjectFile = useCallback((): ProjectFile => ({
+    app: "Perfect Pixels",
+    version: 1,
+    sheetName,
+    frameWidth,
+    frameHeight,
+    columns,
+    rows,
+    fps,
+    activeIndex,
+    customPalettes,
+    activePaletteId,
+    layers,
+    frames: frames.map((frame) => frame.layers.map((layerImageData) => imageDataToCanvas(layerImageData).toDataURL("image/png"))),
+  }), [activeIndex, activePaletteId, columns, customPalettes, fps, frameHeight, frameWidth, frames, layers, rows, sheetName]);
+  const projectSnapshot = useMemo(() => JSON.stringify(buildProjectFile()), [buildProjectFile]);
+  const isDirty = lastSavedSnapshot === null ? projectOrigin !== "new" : projectSnapshot !== lastSavedSnapshot;
+  const projectStatusLabel = useMemo(() => {
+    if (projectOrigin === "restored") return "自动恢复工程（未保存）";
+    if (projectOrigin === "imported") return "从图片导入的新工程（未保存）";
+    if (projectOrigin === "saved") return isDirty ? "已修改未保存" : "已保存工程";
+    return isDirty ? "新建未保存工程" : "新建空白工程";
+  }, [isDirty, projectOrigin]);
 
   useEffect(() => {
     window.localStorage.setItem(CUSTOM_PALETTES_KEY, JSON.stringify(customPalettes));
@@ -670,6 +706,8 @@ function App() {
   }, [activeIndex, fps, frames.length, isPlaying]);
 
   const importImage = async (file: File) => {
+    const canContinue = await confirmUnsavedAction("导入新逐帧图会替换当前画布、帧和图层。");
+    if (!canContinue) return;
     const img = new Image();
     img.src = URL.createObjectURL(file);
     await img.decode();
@@ -691,6 +729,8 @@ function App() {
     projectFileHandleRef.current = null;
     setProjectFileName(null);
     setProjectFileBound(false);
+    setProjectOrigin("imported");
+    setLastSavedSnapshot(null);
     setExportStatus(`已导入 ${file.name}，当前为未保存的新工程`);
   };
 
@@ -909,22 +949,6 @@ function App() {
     void downloadCanvas(imageDataToCanvas(compositedActiveFrame), `${sheetName}_frame_${String(activeIndex + 1).padStart(2, "0")}.png`);
   };
 
-  const buildProjectFile = (): ProjectFile => ({
-    app: "Perfect Pixels",
-    version: 1,
-    sheetName,
-    frameWidth,
-    frameHeight,
-    columns,
-    rows,
-    fps,
-    activeIndex,
-    customPalettes,
-    activePaletteId,
-    layers,
-    frames: frames.map((frame) => frame.layers.map((layerImageData) => imageDataToCanvas(layerImageData).toDataURL("image/png"))),
-  });
-
   const downloadProjectBlob = (blob: Blob) => {
     const link = document.createElement("a");
     link.download = `${sheetName || "pixel_frame_project"}.pfe.json`;
@@ -940,36 +964,56 @@ function App() {
   };
 
   const saveProject = async (saveAs = false) => {
-    const blob = new Blob([JSON.stringify(buildProjectFile())], { type: "application/json" });
-    if (!saveAs && projectFileHandleRef.current) {
-      await writeProjectToHandle(projectFileHandleRef.current, blob);
-      setProjectFileBound(true);
-      setExportStatus(`已保存工程：${projectFileName ?? "当前工程"}`);
-      return;
-    }
+    const projectText = JSON.stringify(buildProjectFile());
+    const blob = new Blob([projectText], { type: "application/json" });
+    try {
+      if (!saveAs && projectFileHandleRef.current) {
+        await writeProjectToHandle(projectFileHandleRef.current, blob);
+        setProjectFileBound(true);
+        setProjectOrigin("saved");
+        setLastSavedSnapshot(projectText);
+        window.localStorage.removeItem(AUTOSAVE_KEY);
+        setExportStatus(`已保存工程：${projectFileName ?? "当前工程"}`);
+        return true;
+      }
 
-    if (window.showSaveFilePicker) {
-      const handle = await window.showSaveFilePicker({
-        suggestedName: `${sheetName || "pixel_frame_project"}.pfe.json`,
-        types: [{ description: "Perfect Pixels Project", accept: { "application/json": [".pfe.json", ".json"] } }],
-      });
-      projectFileHandleRef.current = handle;
-      setProjectFileName(handle.name);
-      setProjectFileBound(true);
-      await writeProjectToHandle(handle, blob);
-      setExportStatus(`已保存工程：${handle.name}`);
-      return;
-    }
+      if (window.showSaveFilePicker) {
+        const handle = await window.showSaveFilePicker({
+          suggestedName: `${sheetName || "pixel_frame_project"}.pfe.json`,
+          types: [{ description: "Perfect Pixels Project", accept: { "application/json": [".pfe.json", ".json"] } }],
+        });
+        projectFileHandleRef.current = handle;
+        setProjectFileName(handle.name);
+        setProjectFileBound(true);
+        setProjectOrigin("saved");
+        await writeProjectToHandle(handle, blob);
+        setLastSavedSnapshot(projectText);
+        window.localStorage.removeItem(AUTOSAVE_KEY);
+        setExportStatus(`已保存工程：${handle.name}`);
+        return true;
+      }
 
-    downloadProjectBlob(blob);
-    projectFileHandleRef.current = null;
-    setProjectFileBound(false);
-    setExportStatus("已下载工程文件；浏览器模式下不会绑定覆盖保存位置");
+      downloadProjectBlob(blob);
+      projectFileHandleRef.current = null;
+      setProjectFileName(`${sheetName || "pixel_frame_project"}.pfe.json`);
+      setProjectFileBound(false);
+      setProjectOrigin("saved");
+      setLastSavedSnapshot(projectText);
+      window.localStorage.removeItem(AUTOSAVE_KEY);
+      setExportStatus("已下载工程文件；浏览器模式下不会绑定覆盖保存位置");
+      return true;
+    } catch (error) {
+      setExportStatus(`保存已取消或失败：${String(error)}`);
+      return false;
+    }
   };
 
-  const openProject = async (file: File, handle: ProjectFileHandle | null = null) => {
-    const text = await file.text();
-    const project = JSON.parse(text) as ProjectFile;
+  const applyProjectData = useCallback(async (
+    project: ProjectFile,
+    displayName: string,
+    handle: ProjectFileHandle | null,
+    origin: ProjectOrigin,
+  ) => {
     if (!["Perfect Pixels", "Pixel Frame Editor"].includes(project.app) || project.version !== 1 || !Array.isArray(project.frames)) {
       throw new Error("Not a supported Perfect Pixels project file.");
     }
@@ -987,8 +1031,8 @@ function App() {
         return { id: makeId(), layers: loadedLayers.slice(0, projectLayers.length) };
       }),
     );
-    if (loadedFrames.length === 0) return;
-    pushHistory();
+    if (loadedFrames.length === 0) return false;
+    if (origin !== "restored") pushHistory();
     setFrames(loadedFrames);
     setActiveIndex(Math.min(project.activeIndex ?? 0, loadedFrames.length - 1));
     setLayers(projectLayers);
@@ -999,17 +1043,53 @@ function App() {
     setColumns(project.columns || loadedFrames.length);
     setRows(project.rows || 1);
     setFps(project.fps || 8);
-    setSheetName(project.sheetName || file.name.replace(/\.pfe\.json$|\.json$/i, "") || "edited_sprite_sheet");
+    setSheetName(project.sheetName || displayName.replace(/\.pfe\.json$|\.json$/i, "") || "edited_sprite_sheet");
     setCustomPalettes(project.customPalettes ?? []);
     setActivePaletteId(project.activePaletteId ?? DEFAULT_PALETTE_ID);
     setSourceSheet(null);
     projectFileHandleRef.current = handle;
-    setProjectFileName(handle?.name ?? file.name);
+    setProjectFileName(displayName);
     setProjectFileBound(Boolean(handle));
-    setExportStatus(`已打开工程：${handle?.name ?? file.name}`);
+    setProjectOrigin(origin);
+    if (origin === "saved") {
+      shouldCaptureCleanSnapshotRef.current = true;
+      window.localStorage.removeItem(AUTOSAVE_KEY);
+    } else {
+      setLastSavedSnapshot(null);
+    }
+    setExportStatus(origin === "restored" ? `已恢复自动保存：${displayName}` : `已打开工程：${displayName}`);
+    return true;
+  }, [pushHistory]);
+
+  const openProject = async (file: File, handle: ProjectFileHandle | null = null) => {
+    const text = await file.text();
+    const project = JSON.parse(text) as ProjectFile;
+    await applyProjectData(project, handle?.name ?? file.name, handle, "saved");
+  };
+
+  const requestUnsavedDecision = (message: string) =>
+    new Promise<UnsavedDecision>((resolve) => {
+      unsavedPromptResolveRef.current = resolve;
+      setUnsavedPrompt({ message });
+    });
+
+  const resolveUnsavedPrompt = (decision: UnsavedDecision) => {
+    unsavedPromptResolveRef.current?.(decision);
+    unsavedPromptResolveRef.current = null;
+    setUnsavedPrompt(null);
+  };
+
+  const confirmUnsavedAction = async (message: string) => {
+    if (!isDirty) return true;
+    const decision = await requestUnsavedDecision(message);
+    if (decision === "cancel") return false;
+    if (decision === "discard") return true;
+    return saveProject();
   };
 
   const openProjectFromPicker = async () => {
+    const canContinue = await confirmUnsavedAction("打开其他工程会替换当前画布、帧和图层。");
+    if (!canContinue) return;
     if (window.showOpenFilePicker) {
       const [handle] = await window.showOpenFilePicker({
         multiple: false,
@@ -1021,6 +1101,96 @@ function App() {
     }
     projectFileInputRef.current?.click();
   };
+
+  useEffect(() => {
+    if (shouldCaptureCleanSnapshotRef.current) {
+      setLastSavedSnapshot(projectSnapshot);
+      shouldCaptureCleanSnapshotRef.current = false;
+    }
+  }, [projectSnapshot]);
+
+  useEffect(() => {
+    document.title = `Perfect Pixels - ${projectTitle}${isDirty ? " *" : ""}`;
+  }, [isDirty, projectTitle]);
+
+  useEffect(() => {
+    const handleBeforeUnload = (event: BeforeUnloadEvent) => {
+      if (allowWindowCloseRef.current) return;
+      if (!isDirty) return;
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", handleBeforeUnload);
+    return () => window.removeEventListener("beforeunload", handleBeforeUnload);
+  }, [isDirty]);
+
+  useEffect(() => {
+    if (!isTauriRuntime()) return;
+    let disposed = false;
+    let unlisten: (() => void) | null = null;
+    const appWindow = getCurrentWindow();
+    void appWindow.onCloseRequested(async (event) => {
+      if (allowWindowCloseRef.current || !isDirty) return;
+      event.preventDefault();
+      const decision = await requestUnsavedDecision("关闭软件前需要处理当前工程的未保存修改。");
+      if (decision === "cancel") return;
+      if (decision === "save") {
+        const saved = await saveProject();
+        if (!saved) return;
+      }
+      allowWindowCloseRef.current = true;
+      await appWindow.close();
+    }).then((handler) => {
+      if (disposed) handler();
+      else unlisten = handler;
+    });
+
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [isDirty, projectSnapshot]);
+
+  useEffect(() => {
+    if (didCheckAutosaveRef.current) return;
+    didCheckAutosaveRef.current = true;
+    const raw = window.localStorage.getItem(AUTOSAVE_KEY);
+    if (!raw) return;
+    try {
+      const autosave = JSON.parse(raw) as { savedAt?: number; project?: ProjectFile; projectFileName?: string | null };
+      if (!autosave.project) return;
+      const savedAt = autosave.savedAt ? new Date(autosave.savedAt).toLocaleString() : "未知时间";
+      const shouldRestore = window.confirm(`发现未恢复工程（${savedAt}）。是否恢复？`);
+      if (shouldRestore) {
+        void applyProjectData(autosave.project, autosave.projectFileName ?? "自动恢复工程", null, "restored");
+      } else {
+        window.localStorage.removeItem(AUTOSAVE_KEY);
+      }
+    } catch {
+      window.localStorage.removeItem(AUTOSAVE_KEY);
+    }
+  }, [applyProjectData]);
+
+  useEffect(() => {
+    if (!isDirty) {
+      if (projectOrigin === "saved") window.localStorage.removeItem(AUTOSAVE_KEY);
+      return;
+    }
+
+    const writeAutosave = () => {
+      const autosave = {
+        savedAt: Date.now(),
+        project: buildProjectFile(),
+        projectFileName,
+        projectOrigin,
+      };
+      window.localStorage.setItem(AUTOSAVE_KEY, JSON.stringify(autosave));
+    };
+
+    writeAutosave();
+    const timer = window.setInterval(writeAutosave, AUTOSAVE_INTERVAL_MS);
+    return () => window.clearInterval(timer);
+  }, [buildProjectFile, isDirty, projectFileName, projectOrigin]);
 
   const undo = () => {
     const previous = history.at(-1);
@@ -1292,6 +1462,20 @@ function App() {
         </div>
       </header>
       {exportStatus && <div className="export-status">{exportStatus}</div>}
+      {unsavedPrompt && (
+        <div className="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="unsaved-title">
+          <div className="modal-card">
+            <h2 id="unsaved-title">有未保存的修改</h2>
+            <p>{unsavedPrompt.message}</p>
+            <p className="hint">当前工程：{projectTitle}{isDirty ? " *" : ""}</p>
+            <div className="modal-actions">
+              <button className="primary" onClick={() => resolveUnsavedPrompt("save")}>保存</button>
+              <button onClick={() => resolveUnsavedPrompt("discard")}>不保存</button>
+              <button onClick={() => resolveUnsavedPrompt("cancel")}>取消</button>
+            </div>
+          </div>
+        </div>
+      )}
 
       <section className="workspace">
         <aside className="panel tools-panel">
@@ -1651,19 +1835,21 @@ function App() {
                 accept="application/json,.json,.pfe.json"
                 onChange={(event) => {
                   const file = event.target.files?.[0];
-                  if (file) void openProject(file);
+                  if (file) {
+                    void (async () => {
+                      const canContinue = await confirmUnsavedAction("打开其他工程会替换当前画布、帧和图层。");
+                      if (canContinue) await openProject(file);
+                    })();
+                  }
                   event.currentTarget.value = "";
                 }}
               />
             </label>
           </div>
           <p className="project-status">
-            当前工程：
-            {projectFileName
-              ? projectFileBound
-                ? projectFileName
-                : `${projectFileName}（未绑定保存位置，保存时会另存）`
-              : "未保存新工程（保存时会选择新文件）"}
+            当前工程：{projectTitle}{isDirty ? " *" : ""}<br />
+            状态：{projectStatusLabel}
+            {projectFileName && !projectFileBound ? "；未绑定保存位置，保存时会另存" : ""}
           </p>
           <div className="field-grid">
             <label>
